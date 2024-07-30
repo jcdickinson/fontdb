@@ -75,6 +75,13 @@ pub use ttf_parser::Width as Stretch;
 use slotmap::SlotMap;
 use tinyvec::TinyVec;
 
+/// A unix file identifier. This is the device ID and the inode number.
+#[cfg(all(unix, feature = "fs"))]
+type FileIdentifier = (u64, u64);
+
+#[cfg(all(not(unix), feature = "fs"))]
+type FileIdentifier = ();
+
 /// A unique per database face ID.
 ///
 /// Since `Database` is not global/unique, we cannot guarantee that a specific ID
@@ -302,38 +309,111 @@ impl Database {
     /// It will simply skip malformed fonts and will print a warning into the log for each of them.
     #[cfg(feature = "fs")]
     pub fn load_fonts_dir<P: AsRef<std::path::Path>>(&mut self, dir: P) {
-        self.load_fonts_dir_impl(dir.as_ref())
+        self.load_fonts_dir_impl(dir.as_ref(), &mut Default::default())
+    }
+
+    #[cfg(all(unix, feature = "fs", feature = "dir-symlink"))]
+    fn canonicalize(
+        &self,
+        path: std::path::PathBuf,
+        entry: std::fs::DirEntry,
+        seen: &mut std::collections::HashSet<FileIdentifier>,
+    ) -> Option<(std::path::PathBuf, std::fs::FileType)> {
+        use std::os::unix::prelude::MetadataExt as _;
+
+        let file_type = entry.file_type().ok()?;
+        if !file_type.is_symlink() {
+            // Once we have seen a symlink we have to guarantee that we don't add files again via their canonical path.
+            if seen.capacity() != 0 {
+                let stat = std::fs::symlink_metadata(&path).ok()?;
+                if !seen.insert((stat.ino(), stat.dev())) {
+                    return None;
+                }
+            }
+
+            return Some((path, file_type));
+        }
+
+        if seen.capacity() == 0 && file_type.is_dir() {
+            // We're entering the "slow path".
+
+            // It's not unreasonable to have >500 font *faces* on the system. Pre-allocate two pages (8kB) of space
+            // to prevent a lot of reallocs. With (ino, dev) that will be enough space for 512 entries.
+            seen.reserve(8192 / std::mem::size_of::<FileIdentifier>());
+
+            // We may have already discovered files in their canonical location that will be later found via a symlink.
+            for (_, info) in self.faces.iter() {
+                let path = match &info.source {
+                    Source::Binary(_) => continue,
+                    Source::File(path) => path.as_path(),
+                    Source::SharedFile(path, _) => path.as_path(),
+                };
+                let Ok(stat) = std::fs::metadata(path) else {
+                    continue;
+                };
+                seen.insert((stat.ino(), stat.dev()));
+            }
+        }
+
+        let stat = std::fs::metadata(&path).ok()?;
+        if stat.is_symlink() || !seen.insert((stat.ino(), stat.dev())) {
+            return None;
+        }
+
+        let canon = std::fs::canonicalize(path).ok()?;
+        Some((canon, stat.file_type()))
+    }
+
+    #[cfg(all(feature = "fs", not(all(unix, feature = "dir-symlink"))))]
+    fn canonicalize(
+        &self,
+        path: std::path::PathBuf,
+        entry: std::fs::DirEntry,
+        _: &mut std::collections::HashSet<FileIdentifier>,
+    ) -> Option<(std::path::PathBuf, std::fs::FileType)> {
+        let file_type = entry.file_type().ok()?;
+        if !file_type.is_symlink() {
+            return Some((path, file_type));
+        }
+
+        let stat = std::fs::metadata(&path).ok()?;
+        if stat.is_file() {
+            Some((path, stat.file_type()))
+        } else {
+            None
+        }
     }
 
     // A non-generic version.
-    #[rustfmt::skip] // keep extensions match as is
     #[cfg(feature = "fs")]
-    fn load_fonts_dir_impl(&mut self, dir: &std::path::Path) {
+    fn load_fonts_dir_impl(
+        &mut self,
+        dir: &std::path::Path,
+        seen: &mut std::collections::HashSet<FileIdentifier>,
+    ) {
         let fonts_dir = match std::fs::read_dir(dir) {
             Ok(dir) => dir,
             Err(_) => return,
         };
 
         for entry in fonts_dir.flatten() {
-            let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(t) => t,
-                Err(_) => return,
+            let Some((path, file_type)) = self.canonicalize(entry.path(), entry, seen) else {
+                continue;
             };
 
             if file_type.is_file() {
                 match path.extension().and_then(|e| e.to_str()) {
+                    #[rustfmt::skip] // keep extensions match as is
                     Some("ttf") | Some("ttc") | Some("TTF") | Some("TTC") |
                     Some("otf") | Some("otc") | Some("OTF") | Some("OTC") => {
                         if let Err(e) = self.load_font_file(&path) {
                             log::warn!("Failed to load '{}' cause {}.", path.display(), e);
                         }
-                    }
+                    },
                     _ => {}
                 }
             } else if file_type.is_dir() {
-                // TODO: ignore symlinks?
-                self.load_fonts_dir(path);
+                self.load_fonts_dir_impl(&path, seen);
             }
         }
     }

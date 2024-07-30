@@ -11,9 +11,10 @@ fn main() {
     db.set_fantasy_family("Impact");
     db.set_monospace_family("Courier New");
     println!(
-        "Loaded {} font faces in {}ms.",
+        "Loaded {} font faces in {}ms ({}μs per).",
         db.len(),
-        now.elapsed().as_millis()
+        now.elapsed().as_millis(),
+        (now.elapsed() / db.len() as u32).as_micros()
     );
 
     const FAMILY_NAME: &str = "Times New Roman";

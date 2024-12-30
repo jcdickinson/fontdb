@@ -312,7 +312,7 @@ impl Database {
         self.load_fonts_dir_impl(dir.as_ref(), &mut Default::default())
     }
 
-    #[cfg(all(unix, feature = "fs", feature = "dir-symlink"))]
+    #[cfg(all(unix, feature = "fs"))]
     fn canonicalize(
         &self,
         path: std::path::PathBuf,
@@ -362,26 +362,6 @@ impl Database {
 
         let canon = std::fs::canonicalize(path).ok()?;
         Some((canon, stat.file_type()))
-    }
-
-    #[cfg(all(feature = "fs", not(all(unix, feature = "dir-symlink"))))]
-    fn canonicalize(
-        &self,
-        path: std::path::PathBuf,
-        entry: std::fs::DirEntry,
-        _: &mut std::collections::HashSet<FileIdentifier>,
-    ) -> Option<(std::path::PathBuf, std::fs::FileType)> {
-        let file_type = entry.file_type().ok()?;
-        if !file_type.is_symlink() {
-            return Some((path, file_type));
-        }
-
-        let stat = std::fs::metadata(&path).ok()?;
-        if stat.is_file() {
-            Some((path, stat.file_type()))
-        } else {
-            None
-        }
     }
 
     // A non-generic version.
